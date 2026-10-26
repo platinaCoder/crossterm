@@ -680,6 +680,36 @@ pub(crate) fn parse_csi_special_key_code(buffer: &[u8]) -> io::Result<Option<Int
     // This CSI sequence can be a list of semicolon-separated numbers.
     let first = next_parsed::<u8>(&mut split)?;
 
+    // xterm modifyOtherKeys format: CSI 27 ; modifier ; codepoint ~
+    // tmux emits this form when `extended-keys-format` is `xterm`. Treat it as the
+    // equivalent CSI-u key event so modified control keys such as Shift+Enter are
+    // not dropped before reaching applications.
+    if first == 27 {
+        let modifier_mask = next_parsed::<u8>(&mut split)?;
+        let codepoint = next_parsed::<u32>(&mut split)?;
+        if split.next().is_some() {
+            return Err(could_not_parse_event_error());
+        }
+        let modifiers = parse_modifiers(modifier_mask);
+        let keycode = match char::from_u32(codepoint) {
+            Some('\x1B') => KeyCode::Esc,
+            Some('\r') => KeyCode::Enter,
+            Some('\t') if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+            Some('\t') => KeyCode::Tab,
+            Some('\x7F') => KeyCode::Backspace,
+            Some(character) => KeyCode::Char(character),
+            None => return Err(could_not_parse_event_error()),
+        };
+        return Ok(Some(InternalEvent::Event(Event::Key(
+            KeyEvent::new_with_kind_and_state(
+                keycode,
+                modifiers,
+                KeyEventKind::Press,
+                parse_modifiers_to_state(modifier_mask),
+            ),
+        ))));
+    }
+
     let (modifiers, kind, state) =
         if let Ok((modifier_mask, kind_code)) = modifier_and_kind_parsed(&mut split) {
             (
@@ -1102,6 +1132,24 @@ mod tests {
             Some(InternalEvent::Event(Event::Key(KeyEvent::new(
                 KeyCode::Delete,
                 KeyModifiers::SHIFT
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_parse_xterm_modify_other_keys() {
+        assert_eq!(
+            parse_csi_special_key_code(b"\x1B[27;2;13~").unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::SHIFT
+            )))),
+        );
+        assert_eq!(
+            parse_csi_special_key_code(b"\x1B[27;5;99~").unwrap(),
+            Some(InternalEvent::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
             )))),
         );
     }
